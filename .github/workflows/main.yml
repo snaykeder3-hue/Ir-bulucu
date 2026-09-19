@@ -1,0 +1,38 @@
+name: APK derle
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Proje dosyalarini olustur
+        run: bash setup.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: APK derle
+        run: gradle assembleDebug --no-daemon
+
+      - name: Releases sayfasina yukle
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: IR Lamba Bulucu (son surum)
+          files: build/outputs/apk/debug/*.apk
+          
