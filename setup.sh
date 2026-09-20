@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IR Lamba Bulucu v2 - proje dosyalarini olusturur (GitHub Actions bu dosyayi calistirir)
+# IR Lamba Bulucu v3 - proje dosyalarini olusturur (GitHub Actions bu dosyayi calistirir)
 set -e
 mkdir -p "."
 cat > "settings.gradle.kts" <<'__IR_EOF__'
@@ -34,8 +34,8 @@ android {
         applicationId = "com.example.irbulucu"
         minSdk = 21
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     // Sabit imza: her derlemede ayni anahtar kullanilir, boylece uygulama
@@ -125,15 +125,37 @@ class CodeSpec(val proto: Proto, val addr: Int, val cmd: Int) {
 
 object IrGen {
 
-    /** Kumanda panelindeki varsayılan tuşlar (LED lamba kumandası düzeni). */
+    // Panelin en üstünde gösterilen ana tuşlar
+    const val KEY_ON = "POWER ON"
+    const val KEY_OFF = "POWER OFF"
+    const val KEY_DOWN = "BRIGHTNESS -"
+    const val KEY_UP = "BRIGHTNESS +"
+
+    val MAIN_KEYS: List<String> = listOf(KEY_ON, KEY_OFF, KEY_DOWN, KEY_UP)
+
+    /** Tuş atarken sunulan varsayılan tuş adları (LED lamba kumandası düzeni). */
     val DEFAULT_KEYS: List<String> = listOf(
+        KEY_ON, KEY_OFF, KEY_DOWN, KEY_UP,
         "RED", "GREEN", "BLUE", "YELLOW", "PURPLE",
-        "POWER ON", "POWER OFF", "DARK GREEN", "WHITE", "ORANGE",
+        "DARK GREEN", "WHITE", "ORANGE",
         "6-COLOR ALTERNATION", "PINK", "LIGHT BLUE", "DARK YELLOW",
         "7 COLOR GRADIENT", "DEEP BLUE", "AZURE", "MAGENTA",
-        "3 COLORS JUMP", "LIGHT GREEN", "LIGHT YELLOW", "7 COLORS JUMP",
-        "BRIGHTNESS +", "BRIGHTNESS -"
+        "3 COLORS JUMP", "LIGHT GREEN", "LIGHT YELLOW", "7 COLORS JUMP"
     )
+
+    /** Düğme üzerinde görünen kısa yazı (parlaklık tuşları + / − olarak). */
+    fun keyLabel(name: String): String = when (name) {
+        KEY_UP -> "+"
+        KEY_DOWN -> "−"
+        else -> name
+    }
+
+    /** Listelerde görünen açıklayıcı yazı. */
+    fun keyPickerLabel(name: String): String = when (name) {
+        KEY_UP -> "＋  Işık artır"
+        KEY_DOWN -> "−  Işık azalt"
+        else -> name
+    }
 
     // En sık görülen NEC adresleri (LED şerit/ucuz lamba kumandaları çoğunlukla 0x00, 0x80, 0x40...)
     private val NEC_PRIORITY = intArrayOf(
@@ -320,11 +342,19 @@ class Remote(
     var name: String,
     val proto: Proto,
     val addr: Int,
-    val keys: MutableList<Key>
+    val keys: MutableList<Key>,
+    var lastPos: Int = -1 // tuş öğretirken kalınan son komut numarası
 ) {
     fun spec(cmd: Int): CodeSpec = CodeSpec(proto, addr, cmd)
 
     fun key(keyName: String): Key? = keys.firstOrNull { it.name == keyName }
+
+    /** Açma, kapama, ışık azalt, ışık artır tuşları her zaman listede bulunur. */
+    fun ensureMain() {
+        for (n in IrGen.MAIN_KEYS) {
+            if (key(n) == null) keys.add(Key(n, -1))
+        }
+    }
 
     fun toJson(): JSONObject {
         val arr = JSONArray()
@@ -334,6 +364,7 @@ class Remote(
             .put("name", name)
             .put("proto", proto.name)
             .put("addr", addr)
+            .put("lp", lastPos)
             .put("keys", arr)
     }
 
@@ -346,14 +377,15 @@ class Remote(
             foundKey: String,
             id: Long
         ): Remote {
-            val keys = IrGen.DEFAULT_KEYS.map { Key(it, -1) }.toMutableList()
+            val keys = ArrayList<Key>()
+            for (n in IrGen.MAIN_KEYS) keys.add(Key(n, -1))
             val existing = keys.firstOrNull { it.name == foundKey }
             if (existing != null) {
                 existing.cmd = foundCmd
             } else {
                 keys.add(Key(foundKey, foundCmd))
             }
-            return Remote(id, name, proto, addr, keys)
+            return Remote(id, name, proto, addr, keys, foundCmd)
         }
 
         fun fromJson(o: JSONObject): Remote? {
@@ -363,13 +395,20 @@ class Remote(
                     val k = arr.getJSONObject(it)
                     Key(k.getString("n"), k.getInt("c"))
                 }
-                Remote(
+                var lp = o.optInt("lp", -1)
+                if (lp < 0) {
+                    lp = keys.firstOrNull { it.cmd >= 0 }?.cmd ?: -1
+                }
+                val r = Remote(
                     o.getLong("id"),
                     o.getString("name"),
                     Proto.valueOf(o.getString("proto")),
                     o.getInt("addr"),
-                    keys
+                    keys,
+                    lp
                 )
+                r.ensureMain()
+                r
             } catch (e: Exception) {
                 null
             }
@@ -441,7 +480,7 @@ class RemoteStore(ctx: Context) {
         val addr = m.groupValues[2].toInt(16)
         val cmd = m.groupValues[3].toInt(16)
         return Remote.create(
-            o.optString("name", "Lamba"), proto, addr, cmd, "POWER ON",
+            o.optString("name", "Lamba"), proto, addr, cmd, IrGen.KEY_ON,
             System.currentTimeMillis() + idx
         )
     }
@@ -459,12 +498,179 @@ fun remoteInfoText(r: Remote): String {
         sb.append("Adres: 0x").append("%02X".format(r.addr)).append("\n")
         sb.append("Olası cihaz: ").append(IrGen.guess(r.proto, r.addr)).append("\n\n")
     }
-    sb.append("Öğrenilen tuşlar (").append(learned.size).append("/").append(r.keys.size).append("):\n")
+    sb.append("Öğrenilen tuşlar (").append(learned.size).append("):\n")
     for (k in learned) {
-        sb.append("• ").append(k.name).append("  →  0x")
+        sb.append("• ").append(IrGen.keyPickerLabel(k.name)).append("  →  0x")
             .append("%02X".format(k.cmd)).append(" (").append(k.cmd).append(")\n")
     }
     return sb.toString()
+}
+__IR_EOF__
+mkdir -p "src/main/java/com/example/irbulucu"
+cat > "src/main/java/com/example/irbulucu/RemoteCardView.kt" <<'__IR_EOF__'
+package com.example.irbulucu
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.RadialGradient
+import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.text.TextPaint
+import android.text.TextUtils
+import android.view.View
+
+/**
+ * Yatay bir IR kumandası çizer: solda güç düğmesi, ortada kumandaya verilen ad,
+ * sağda renk tuşları ve en uçta IR ledi.
+ */
+class RemoteCardView(ctx: Context) : View(ctx) {
+
+    private var title = ""
+    private var subtitle = ""
+    private val d = ctx.resources.displayMetrics.density
+
+    private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val symPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+    private val subPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+    private val rect = RectF()
+    private val tmp = RectF()
+
+    private val dotColors = intArrayOf(
+        Color.parseColor("#E53935"), Color.parseColor("#43A047"), Color.parseColor("#1E88E5"),
+        Color.parseColor("#FDD835"), Color.parseColor("#8E24AA"), Color.parseColor("#ECEFF1")
+    )
+
+    init {
+        isClickable = true
+        setLayerType(LAYER_TYPE_SOFTWARE, null)
+
+        linePaint.style = Paint.Style.STROKE
+        linePaint.strokeWidth = 1.5f * d
+
+        symPaint.style = Paint.Style.STROKE
+        symPaint.strokeWidth = 2.4f * d
+        symPaint.strokeCap = Paint.Cap.ROUND
+        symPaint.color = Color.WHITE
+
+        titlePaint.color = Color.WHITE
+        titlePaint.textSize = 20f * d
+        titlePaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+
+        subPaint.color = Color.parseColor("#B4B4BE")
+        subPaint.textSize = 12f * d
+    }
+
+    fun setInfo(t: String, s: String) {
+        title = t
+        subtitle = s
+        invalidate()
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val w = MeasureSpec.getSize(widthMeasureSpec)
+        setMeasuredDimension(w, (116 * d).toInt())
+    }
+
+    override fun drawableStateChanged() {
+        super.drawableStateChanged()
+        invalidate()
+    }
+
+    override fun onDraw(c: Canvas) {
+        super.onDraw(c)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val pad = 8f * d
+        rect.set(pad, pad, w - pad, h - pad - 4f * d)
+        val radius = rect.height() * 0.30f
+        val cy = rect.centerY()
+
+        // --- Gövde + gölge ---
+        bodyPaint.setShadowLayer(9f * d, 0f, 3f * d, Color.argb(140, 0, 0, 0))
+        val topColor = if (isPressed) Color.parseColor("#4C4C55") else Color.parseColor("#3E3E46")
+        bodyPaint.shader = LinearGradient(
+            0f, rect.top, 0f, rect.bottom,
+            topColor, Color.parseColor("#1B1B1F"), Shader.TileMode.CLAMP
+        )
+        c.drawRoundRect(rect, radius, radius, bodyPaint)
+
+        // Kenar çizgisi
+        linePaint.color = Color.parseColor("#63636D")
+        c.drawRoundRect(rect, radius, radius, linePaint)
+
+        // İç parlama
+        tmp.set(rect.left + 3f * d, rect.top + 3f * d, rect.right - 3f * d, rect.bottom - 3f * d)
+        linePaint.color = Color.argb(28, 255, 255, 255)
+        c.drawRoundRect(tmp, radius - 3f * d, radius - 3f * d, linePaint)
+
+        // --- Güç düğmesi (solda) ---
+        val pr = 17f * d
+        val pcx = rect.left + 20f * d + pr
+        fillPaint.shader = RadialGradient(
+            pcx - pr * 0.3f, cy - pr * 0.3f, pr * 1.4f,
+            Color.parseColor("#FF6B6B"), Color.parseColor("#A61B1B"), Shader.TileMode.CLAMP
+        )
+        c.drawCircle(pcx, cy, pr, fillPaint)
+        fillPaint.shader = null
+        linePaint.color = Color.argb(90, 255, 255, 255)
+        c.drawCircle(pcx, cy, pr, linePaint)
+
+        val sr = 6.5f * d
+        tmp.set(pcx - sr, cy - sr + 1.5f * d, pcx + sr, cy + sr + 1.5f * d)
+        c.drawArc(tmp, -60f, 300f, false, symPaint)
+        c.drawLine(pcx, cy - 8f * d, pcx, cy - 0.5f * d, symPaint)
+
+        // --- IR ledi (en sağda) ---
+        val irW = 9f * d
+        val irH = 34f * d
+        val irRight = rect.right - 14f * d
+        tmp.set(irRight - irW, cy - irH / 2f, irRight, cy + irH / 2f)
+        fillPaint.color = Color.parseColor("#0C0C0E")
+        c.drawRoundRect(tmp, 4f * d, 4f * d, fillPaint)
+        fillPaint.color = Color.parseColor("#9B1C1C")
+        c.drawCircle(irRight - irW / 2f, cy, 2.4f * d, fillPaint)
+        fillPaint.color = Color.argb(140, 255, 255, 255)
+        c.drawCircle(irRight - irW / 2f - 0.7f * d, cy - 0.7f * d, 0.9f * d, fillPaint)
+
+        // --- Renkli tuşlar ---
+        val rr = 6.5f * d
+        val gap = 6f * d
+        val clusterW = 3f * (2f * rr) + 2f * gap
+        val clusterRight = irRight - irW - 14f * d
+        val clusterLeft = clusterRight - clusterW
+        val textLeft = pcx + pr + 16f * d
+        val showDots = clusterLeft - textLeft > 70f * d
+        val textRight: Float
+        if (showDots) {
+            textRight = clusterLeft - 12f * d
+            for (i in 0 until 6) {
+                val col = (i % 3).toFloat()
+                val rowSign = if (i < 3) -1f else 1f
+                val x = clusterLeft + rr + col * (2f * rr + gap)
+                val y = cy + rowSign * (rr + gap / 2f)
+                fillPaint.color = dotColors[i]
+                c.drawCircle(x, y, rr, fillPaint)
+                fillPaint.color = Color.argb(80, 255, 255, 255)
+                c.drawCircle(x - rr * 0.3f, y - rr * 0.3f, rr * 0.38f, fillPaint)
+            }
+        } else {
+            textRight = irRight - irW - 12f * d
+        }
+
+        // --- Ad ve alt bilgi ---
+        val maxW = maxOf(textRight - textLeft, 10f * d)
+        val t = TextUtils.ellipsize(title, titlePaint, maxW, TextUtils.TruncateAt.END).toString()
+        val s = TextUtils.ellipsize(subtitle, subPaint, maxW, TextUtils.TruncateAt.END).toString()
+        c.drawText(t, textLeft, cy - 2f * d, titlePaint)
+        c.drawText(s, textLeft, cy + 18f * d, subPaint)
+    }
 }
 __IR_EOF__
 mkdir -p "src/main/java/com/example/irbulucu"
@@ -486,7 +692,6 @@ import android.view.Window
 import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -613,7 +818,9 @@ internal fun uiMessage(a: Activity, title: String, msg: String) {
 }
 
 // =========================================================================
-//  KUMANDA PANELİ  (resimdeki "Daha fazla" sayfası gibi)
+//  KUMANDA PANELİ
+//  Üstte: POWER ON / POWER OFF, altında: ışık azalt (−) / ışık artır (+)
+//  Sonra "Diğer tuşlar" bölümü: atanmış diğer tüm tuşlar.
 // =========================================================================
 
 class RemotePanel(
@@ -625,7 +832,8 @@ class RemotePanel(
 ) {
     private val dialog = Dialog(act)
     private val content = LinearLayout(act)
-    private lateinit var tvTitle: TextView
+    private val card = RemoteCardView(act)
+    private var showOthers = true
 
     fun show() {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -645,27 +853,20 @@ class RemotePanel(
         handle.setOnClickListener { dialog.dismiss() }
         root.addView(handle)
 
-        tvTitle = uiText(act, remote.name, 24f, true)
-        root.addView(tvTitle)
+        card.isClickable = false
         root.addView(
-            uiText(
-                act,
-                remote.proto.name + " • adres 0x" + "%02X".format(remote.addr) +
-                    " • " + (remote.proto.freq / 1000) + " kHz",
-                13f, false, Color.LTGRAY
+            card,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             )
         )
 
         val actions = LinearLayout(act)
         actions.orientation = LinearLayout.HORIZONTAL
         actions.addView(uiPill(act, "ⓘ Bilgi", 13f) { showInfo() }, uiCell(act))
-        actions.addView(uiPill(act, "🔍 Keşfet", 13f) { startLearn(null) }, uiCell(act))
-        actions.addView(uiPill(act, "＋ Yeni tuş", 13f) { addKey() }, uiCell(act))
+        actions.addView(uiPill(act, "＋ Tuş öğret", 13f) { startLearn(null) }, uiCell(act))
         root.addView(actions)
-
-        root.addView(
-            uiText(act, "Basılı tutarak tuşu düzenle / yeniden öğret / sil.", 12f, false, Color.GRAY)
-        )
 
         content.orientation = LinearLayout.VERTICAL
         val scroll = ScrollView(act)
@@ -682,25 +883,86 @@ class RemotePanel(
             w.setGravity(Gravity.BOTTOM)
             w.setLayout(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                (act.resources.displayMetrics.heightPixels * 0.88).toInt()
+                (act.resources.displayMetrics.heightPixels * 0.90).toInt()
             )
         }
     }
 
+    private fun updateCard() {
+        val learned = remote.keys.count { it.cmd >= 0 }
+        card.setInfo(
+            remote.name,
+            remote.proto.name + " • adres 0x" + "%02X".format(remote.addr) + " • " + learned + " tuş"
+        )
+    }
+
     private fun render() {
+        updateCard()
         content.removeAllViews()
-        for (pair in remote.keys.chunked(2)) {
-            val row = LinearLayout(act)
-            row.orientation = LinearLayout.HORIZONTAL
-            for (k in pair) row.addView(keyPill(k), uiCell(act))
-            if (pair.size == 1) row.addView(View(act), uiCell(act))
-            content.addView(row)
+
+        // --- 1. satır: açma / kapama ---
+        val r1 = LinearLayout(act)
+        r1.orientation = LinearLayout.HORIZONTAL
+        r1.addView(mainPill(IrGen.KEY_ON, "POWER ON", 18f, "#2E7D32", "#43A047"), uiCell(act))
+        r1.addView(mainPill(IrGen.KEY_OFF, "POWER OFF", 18f, "#B71C1C", "#D32F2F"), uiCell(act))
+        content.addView(r1)
+
+        // --- 2. satır: ışık azalt / artır ---
+        val r2 = LinearLayout(act)
+        r2.orientation = LinearLayout.HORIZONTAL
+        r2.addView(mainPill(IrGen.KEY_DOWN, IrGen.keyLabel(IrGen.KEY_DOWN), 30f, "#505050", "#6E6E6E"), uiCell(act))
+        r2.addView(mainPill(IrGen.KEY_UP, IrGen.keyLabel(IrGen.KEY_UP), 30f, "#505050", "#6E6E6E"), uiCell(act))
+        content.addView(r2)
+
+        // --- Diğer tuşlar (alt menü) ---
+        val others = remote.keys.filter { it.cmd >= 0 && it.name !in IrGen.MAIN_KEYS }
+        val arrow = if (showOthers) "▴" else "▾"
+        val header = uiText(act, "Diğer tuşlar (" + others.size + ")   " + arrow, 16f, true, Color.LTGRAY)
+        header.setPadding(uiDp(act, 4), uiDp(act, 18), 0, uiDp(act, 8))
+        header.setOnClickListener {
+            showOthers = !showOthers
+            render()
+        }
+        content.addView(header)
+
+        if (showOthers) {
+            if (others.isEmpty()) {
+                content.addView(
+                    uiText(
+                        act,
+                        "Henüz başka tuş atanmadı. “＋ Tuş öğret” ile renk ve mod tuşlarını ekleyin.",
+                        13f, false, Color.GRAY
+                    )
+                )
+            } else {
+                for (pair in others.chunked(2)) {
+                    val row = LinearLayout(act)
+                    row.orientation = LinearLayout.HORIZONTAL
+                    for (k in pair) row.addView(keyPill(k), uiCell(act))
+                    if (pair.size == 1) row.addView(View(act), uiCell(act))
+                    content.addView(row)
+                }
+            }
         }
     }
 
+    private fun mainPill(name: String, label: String, size: Float, normal: String, pressed: String): TextView {
+        val k = remote.key(name)
+        val p = uiPill(act, label, size, Color.parseColor(normal), Color.parseColor(pressed)) {
+            val key = remote.key(name)
+            if (key != null) onKey(key)
+        }
+        if (k == null || k.cmd < 0) p.alpha = 0.45f
+        p.setOnLongClickListener {
+            val key = remote.key(name)
+            if (key != null) keyMenu(key)
+            true
+        }
+        return p
+    }
+
     private fun keyPill(k: Key): TextView {
-        val p = uiPill(act, k.name, 16f) { onKey(k) }
-        if (k.cmd < 0) p.alpha = 0.45f
+        val p = uiPill(act, IrGen.keyLabel(k.name), 16f) { onKey(k) }
         p.setOnLongClickListener {
             keyMenu(k)
             true
@@ -717,7 +979,7 @@ class RemotePanel(
     private fun onKey(k: Key) {
         if (k.cmd < 0) {
             AlertDialog.Builder(act)
-                .setTitle(k.name)
+                .setTitle(IrGen.keyPickerLabel(k.name))
                 .setMessage("Bu tuş henüz öğrenilmedi. Lambayı gözlemleyerek öğretelim mi?")
                 .setPositiveButton("Öğret") { _, _ -> startLearn(k.name) }
                 .setNegativeButton("İptal", null)
@@ -730,22 +992,39 @@ class RemotePanel(
     }
 
     private fun keyMenu(k: Key) {
-        val items = arrayOf("Komutu öğret / değiştir", "Adını değiştir", "Kod bilgisi", "Sil")
+        val isMain = k.name in IrGen.MAIN_KEYS
+        val items = if (isMain) {
+            arrayOf("Komutu yeniden öğret", "Kod bilgisi", "Atamayı kaldır")
+        } else {
+            arrayOf("Komutu yeniden öğret", "Adını değiştir", "Kod bilgisi", "Sil")
+        }
         AlertDialog.Builder(act)
-            .setTitle(k.name)
+            .setTitle(IrGen.keyPickerLabel(k.name))
             .setItems(items) { _, which ->
-                when (which) {
-                    0 -> startLearn(k.name)
-                    1 -> uiAsk(act, "Tuş adı", k.name) { n ->
-                        k.name = n
-                        persist()
+                if (isMain) {
+                    when (which) {
+                        0 -> startLearn(k.name)
+                        1 -> showKeyInfo(k)
+                        2 -> {
+                            k.cmd = -1
+                            persist()
+                        }
+                        else -> {}
                     }
-                    2 -> showKeyInfo(k)
-                    3 -> uiConfirm(act, "“" + k.name + "” tuşu silinsin mi?") {
-                        remote.keys.remove(k)
-                        persist()
+                } else {
+                    when (which) {
+                        0 -> startLearn(k.name)
+                        1 -> uiAsk(act, "Tuş adı", k.name) { n ->
+                            k.name = n
+                            persist()
+                        }
+                        2 -> showKeyInfo(k)
+                        3 -> uiConfirm(act, "“" + k.name + "” tuşu silinsin mi?") {
+                            remote.keys.remove(k)
+                            persist()
+                        }
+                        else -> {}
                     }
-                    else -> {}
                 }
             }
             .show()
@@ -753,9 +1032,9 @@ class RemotePanel(
 
     private fun showKeyInfo(k: Key) {
         if (k.cmd < 0) {
-            uiMessage(act, k.name, "Bu tuş henüz öğrenilmedi.")
+            uiMessage(act, IrGen.keyPickerLabel(k.name), "Bu tuş henüz öğrenilmedi.")
         } else {
-            uiMessage(act, k.name, IrGen.describe(remote.proto, remote.addr, k.cmd))
+            uiMessage(act, IrGen.keyPickerLabel(k.name), IrGen.describe(remote.proto, remote.addr, k.cmd))
         }
     }
 
@@ -763,30 +1042,30 @@ class RemotePanel(
         uiMessage(act, remote.name, remoteInfoText(remote))
     }
 
-    private fun addKey() {
-        uiAsk(act, "Yeni tuş adı", "") { n ->
-            remote.keys.add(Key(n, -1))
-            persist()
-        }
-    }
-
     private fun startLearn(target: String?) {
-        LearnSession(act, remote, target, transmit) { keyName, cmd ->
-            val k = remote.key(keyName)
-            if (k != null) {
-                k.cmd = cmd
-            } else {
-                remote.keys.add(Key(keyName, cmd))
+        LearnSession(
+            act, remote, target, transmit,
+            { keyName, cmd ->
+                val k = remote.key(keyName)
+                if (k != null) {
+                    k.cmd = cmd
+                } else {
+                    remote.keys.add(Key(keyName, cmd))
+                }
+                persist()
+            },
+            {
+                store.upsert(remote)
+                onChanged()
             }
-            persist()
-        }.show()
+        ).show()
     }
 }
 
 // =========================================================================
-//  TUŞ ÖĞRETME / KEŞFETME
-//  Bulunan adresin tüm komutlarını sırayla dener; lamba tepki verince
-//  kullanıcı basar, komut doğrulanır ve tuşa atanır.
+//  TUŞ ÖĞRETME (ELLE, TEK TEK)
+//  Kullanıcı İleri ▶ / ◀ Geri ile komutları tek tek gönderir. Lamba bir
+//  tepki verince (ör. yeşil) "Tuş ata"ya basıp hangi tuş olduğunu seçer.
 // =========================================================================
 
 class LearnSession(
@@ -794,104 +1073,76 @@ class LearnSession(
     private val remote: Remote,
     private val target: String?,
     private val transmit: (Int, IntArray) -> Boolean,
-    private val onAssign: (String, Int) -> Unit
+    private val onAssign: (String, Int) -> Unit,
+    private val onClose: () -> Unit
 ) {
     private val dialog = Dialog(act)
-    private lateinit var tvInfo: TextView
-    private lateinit var progress: ProgressBar
-    private lateinit var btnRun: TextView
-    private lateinit var btnHit: TextView
-    private lateinit var verifyBox: LinearLayout
-    private lateinit var tvVerify: TextView
+    private lateinit var tvCmd: TextView
+    private lateinit var tvSub: TextView
 
-    private val delayMs = 200
-
-    // Denenecek komutlar: başka tuşlara zaten atanmış olanlar atlanır
-    private val cmds: List<Int> = run {
-        val skip = remote.keys
-            .filter { it.cmd >= 0 && it.name != target }
-            .map { it.cmd }
-            .toSet()
-        (0 until IrGen.cmdCount(remote.proto)).filter { it !in skip }
-    }
-
-    @Volatile private var running = false
-    @Volatile private var gen = 0
-    @Volatile private var pos = -1
-    private var stoppedAt = -1
-    private var vpos = 0
+    private val total = IrGen.cmdCount(remote.proto)
+    private var pos = remote.lastPos.coerceIn(-1, total - 1)
+    private var sent = false
 
     fun show() {
-        if (cmds.isEmpty()) {
-            uiToast(act, "Denenecek komut kalmadı")
-            return
-        }
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
 
         val root = LinearLayout(act)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(uiDp(act, 18), uiDp(act, 16), uiDp(act, 18), uiDp(act, 16))
 
-        val title = if (target != null) "“" + target + "” tuşunu öğret" else "Eksik tuşları keşfet"
+        val title = if (target != null) {
+            "“" + IrGen.keyPickerLabel(target) + "” tuşunu öğret"
+        } else {
+            "Tuş öğret"
+        }
         root.addView(uiText(act, title, 20f, true))
+        root.addView(uiText(act, remote.name, 13f, false, Color.LTGRAY))
 
         val hint = if (target != null) {
-            "Taramayı başlat. Lambada “" + target + "” işlevi gerçekleştiği anda " +
-                "TEPKİ VERDİ düğmesine bas."
+            "İleri ▶ ile komutları tek tek gönder. Lambada “" + IrGen.keyPickerLabel(target) +
+                "” işlevi gerçekleşince aşağıdaki yeşil düğmeye bas."
         } else {
-            "Taramayı başlat. Lamba herhangi bir tepki verdiğinde (renk, mod, parlaklık, " +
-                "açma/kapama) TEPKİ VERDİ düğmesine bas; sonra hangi tuş olduğunu seçersin. " +
-                "Tarama kalan tuşların hepsini bulana kadar devam eder."
+            "İleri ▶ ile komutları tek tek gönder. Lambada bir tepki görünce (ör. yeşil renk) " +
+                "“Tuş ata”ya bas ve hangi tuş olduğunu seç. Sonra İleri ile devam et."
         }
-        root.addView(uiText(act, hint, 14f, false, Color.LTGRAY))
+        root.addView(uiText(act, hint, 13f, false, Color.LTGRAY))
 
-        tvInfo = uiText(act, "Hazır: " + cmds.size + " komut denenecek.", 14f)
-        root.addView(tvInfo)
-
-        progress = ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal)
-        progress.max = cmds.size
-        root.addView(progress)
-
-        btnRun = uiPill(act, "▶ Taramayı başlat", 16f) { toggleRun() }
-        root.addView(btnRun, uiRow(act))
-
-        btnHit = uiPill(
-            act, "💡 TEPKİ VERDİ!", 20f,
-            Color.parseColor("#B8860B"), Color.parseColor("#DAA520")
-        ) { onHit() }
-        btnHit.alpha = 0.45f
-        root.addView(btnHit, uiRow(act))
-
-        verifyBox = LinearLayout(act)
-        verifyBox.orientation = LinearLayout.VERTICAL
-        verifyBox.visibility = View.GONE
-        tvVerify = uiText(act, "", 14f)
-        verifyBox.addView(tvVerify)
+        tvCmd = uiText(act, "", 26f, true)
+        tvCmd.gravity = Gravity.CENTER
+        root.addView(tvCmd)
+        tvSub = uiText(act, "", 13f, false, Color.LTGRAY)
+        tvSub.gravity = Gravity.CENTER
+        root.addView(tvSub)
 
         val nav = LinearLayout(act)
         nav.orientation = LinearLayout.HORIZONTAL
-        nav.addView(uiPill(act, "◀", 16f) { step(-1) }, uiCell(act))
-        nav.addView(uiPill(act, "↻ Gönder", 14f) { sendCur() }, uiCell(act))
-        nav.addView(uiPill(act, "▶", 16f) { step(1) }, uiCell(act))
-        verifyBox.addView(nav)
+        nav.addView(uiPill(act, "◀ Geri", 16f) { move(-1) }, uiCell(act))
+        nav.addView(uiPill(act, "↻", 16f) { resend() }, uiCell(act))
+        nav.addView(
+            uiPill(act, "İleri ▶", 18f, Color.parseColor("#1565C0"), Color.parseColor("#1E88E5")) { move(1) },
+            uiCell(act)
+        )
+        root.addView(nav)
 
-        val confirmText = if (target != null) {
-            "✅ Bu komut “" + target + "”"
+        val jump = LinearLayout(act)
+        jump.orientation = LinearLayout.HORIZONTAL
+        jump.addView(uiPill(act, "⏪ −10", 13f) { move(-10) }, uiCell(act))
+        jump.addView(uiPill(act, "+10 ⏩", 13f) { move(10) }, uiCell(act))
+        root.addView(jump)
+
+        val assignText = if (target != null) {
+            "🎯 Bu komut “" + IrGen.keyPickerLabel(target) + "”"
         } else {
-            "✅ Bu komut hangi tuş? (seç)"
+            "🎯 Tuş ata"
         }
-        verifyBox.addView(
+        root.addView(
             uiPill(
-                act, confirmText, 15f,
+                act, assignText, 17f,
                 Color.parseColor("#2E7D32"), Color.parseColor("#43A047")
-            ) { onConfirm() },
+            ) { assign() },
             uiRow(act)
         )
-        verifyBox.addView(
-            uiPill(act, "⏭ Yanlış alarm, taramaya devam", 14f) { start(stoppedAt + 1) },
-            uiRow(act)
-        )
-        root.addView(verifyBox)
 
         root.addView(uiPill(act, "Kapat", 14f) { dialog.dismiss() }, uiRow(act))
 
@@ -902,10 +1153,11 @@ class LearnSession(
         scroll.background = bg
         scroll.addView(root)
 
+        refreshInfo()
         dialog.setContentView(scroll)
         dialog.setOnDismissListener {
-            running = false
-            gen += 1
+            remote.lastPos = pos
+            onClose()
         }
         dialog.show()
 
@@ -920,121 +1172,85 @@ class LearnSession(
         }
     }
 
-    private fun setRunUi(isRunning: Boolean) {
-        btnRun.text = if (isRunning) "⏹ Durdur" else "▶ Taramayı başlat"
-        btnHit.alpha = if (isRunning) 1f else 0.45f
-    }
-
-    private fun toggleRun() {
-        if (running) {
-            running = false
-            stoppedAt = pos
-            setRunUi(false)
+    private fun refreshInfo() {
+        if (pos < 0) {
+            tvCmd.text = "—"
+            tvSub.text = "Henüz komut gönderilmedi. İleri ▶ ile başla."
             return
         }
-        val from = if (pos + 1 >= cmds.size) 0 else pos + 1
-        start(from)
+        tvCmd.text = "Komut 0x%02X  (%d)".format(pos, pos)
+        val assigned = remote.keys.firstOrNull { it.cmd == pos }
+        val assignedText = if (assigned != null) {
+            "Atanmış: " + IrGen.keyPickerLabel(assigned.name)
+        } else {
+            "Atanmamış"
+        }
+        val sentText = if (sent) "" else "  •  (henüz gönderilmedi)"
+        tvSub.text = "Sıra " + (pos + 1) + " / " + total + "  •  " + assignedText + sentText
     }
 
-    private fun start(from: Int) {
-        if (running) return
-        running = true
-        gen += 1
-        val my = gen
-        verifyBox.visibility = View.GONE
-        setRunUi(true)
-
-        val list = cmds
-        val proto = remote.proto
-        val addr = remote.addr
-        Thread {
-            var i = if (from < 0) 0 else from
-            var failed = false
-            while (running && gen == my && i < list.size) {
-                val c = list[i]
-                val pat = CodeSpec(proto, addr, c).pattern()
-                if (!transmit(proto.freq, pat)) {
-                    failed = true
-                    break
-                }
-                pos = i
-                val idx = i
-                act.runOnUiThread {
-                    progress.progress = idx + 1
-                    tvInfo.text = "Komut 0x%02X (%d) gönderildi  [%d/%d]".format(c, c, idx + 1, list.size)
-                }
-                try {
-                    Thread.sleep((pat.sum() / 1000 + delayMs).toLong())
-                } catch (e: InterruptedException) {
-                    break
-                }
-                i++
-            }
-            val finished = i >= list.size
-            act.runOnUiThread {
-                if (gen == my) {
-                    if (failed) {
-                        uiToast(act, "IR gönderilemedi. Bu telefonda IR verici yok olabilir.")
-                    } else if (finished && running) {
-                        uiToast(act, "Tarama bitti.")
-                    }
-                    running = false
-                    setRunUi(false)
-                }
-            }
-        }.start()
+    private fun move(d: Int) {
+        pos = (pos + d).coerceIn(0, total - 1)
+        sendNow()
     }
 
-    private fun onHit() {
-        if (!running || pos < 0) return
-        running = false
-        stoppedAt = pos
-        setRunUi(false)
-        val back = 1500 / (delayMs + 70) + 2 // ~1,5 sn tepki gecikmesi
-        vpos = maxOf(0, pos - back)
-        verifyBox.visibility = View.VISIBLE
-        showVerify()
+    private fun resend() {
+        if (pos < 0) {
+            uiToast(act, "Önce İleri ▶ ile bir komut gönderin")
+            return
+        }
+        sendNow()
     }
 
-    private fun showVerify() {
-        val c = cmds[vpos]
-        tvVerify.text = "Komut 0x%02X (%d)  [%d/%d]\n\n".format(c, c, vpos + 1, cmds.size) +
-            "◀ / ▶ ile komutları tek tek dene (her basışta gönderilir). " +
-            "Lamba istediğin tepkiyi verdiğinde aşağıdan onayla."
-    }
-
-    private fun step(d: Int) {
-        vpos = (vpos + d).coerceIn(0, cmds.size - 1)
-        showVerify()
-        sendCur()
-    }
-
-    private fun sendCur() {
-        val c = cmds[vpos]
-        if (!transmit(remote.proto.freq, CodeSpec(remote.proto, remote.addr, c).pattern())) {
+    private fun sendNow() {
+        sent = true
+        if (!transmit(remote.proto.freq, CodeSpec(remote.proto, remote.addr, pos).pattern())) {
             uiToast(act, "IR gönderilemedi")
         }
+        refreshInfo()
     }
 
-    private fun onConfirm() {
-        val c = cmds[vpos]
+    private fun assign() {
+        if (pos < 0 || !sent) {
+            uiToast(act, "Önce İleri ▶ ile bir komut gönderin")
+            return
+        }
+        val c = pos
         if (target != null) {
-            onAssign(target, c)
-            uiToast(act, target + " öğrenildi: 0x" + "%02X".format(c))
+            assignTo(target, c)
             dialog.dismiss()
             return
         }
-        val names = remote.keys.map { k ->
-            if (k.cmd >= 0) k.name + "  (0x" + "%02X".format(k.cmd) + ")" else k.name
-        }.toTypedArray()
-        val keyNames = remote.keys.map { it.name }
+        pickKey(c)
+    }
+
+    private fun assignTo(name: String, c: Int) {
+        onAssign(name, c)
+        uiToast(act, IrGen.keyPickerLabel(name) + " ← 0x" + "%02X".format(c))
+        refreshInfo()
+    }
+
+    private fun pickKey(c: Int) {
+        val names = ArrayList<String>(IrGen.DEFAULT_KEYS)
+        for (k in remote.keys) {
+            if (k.name !in names) names.add(k.name)
+        }
+        val labels = ArrayList<String>()
+        for (n in names) {
+            val k = remote.key(n)
+            val mark = if (k != null && k.cmd >= 0) "   ✓ 0x" + "%02X".format(k.cmd) else ""
+            labels.add(IrGen.keyPickerLabel(n) + mark)
+        }
+        labels.add("✏️  Özel ad yaz…")
+
         AlertDialog.Builder(act)
-            .setTitle("Bu komut hangi tuş?")
-            .setItems(names) { _, which ->
-                val name = keyNames[which]
-                onAssign(name, c)
-                uiToast(act, name + " ← 0x" + "%02X".format(c))
-                start(vpos + 1) // aynı taramaya devam et
+            .setTitle("Bu komut hangi tuş?  (0x" + "%02X".format(c) + ")")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which < names.size) {
+                    assignTo(names[which], c)
+                } else {
+                    uiAsk(act, "Tuş adı", "") { n -> assignTo(n, c) }
+                }
             }
             .setNegativeButton("İptal", null)
             .show()
@@ -1046,15 +1262,18 @@ cat > "src/main/java/com/example/irbulucu/MainActivity.kt" <<'__IR_EOF__'
 package com.example.irbulucu
 
 import android.content.Context
+import android.graphics.Color
 import android.graphics.Typeface
 import android.hardware.ConsumerIrManager
 import android.os.Bundle
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
@@ -1071,7 +1290,14 @@ class MainActivity : AppCompatActivity() {
     private var ir: ConsumerIrManager? = null
     private val store by lazy { RemoteStore(this) }
 
-    // --- Arayüz ---
+    // --- Sayfalar ve sekmeler ---
+    private lateinit var scanPage: ScrollView
+    private lateinit var savedPage: ScrollView
+    private lateinit var tabScan: TextView
+    private lateinit var tabSaved: TextView
+    private lateinit var savedBox: LinearLayout
+
+    // --- Kumanda arama sayfası ---
     private lateinit var cbProtos: Map<Proto, CheckBox>
     private lateinit var rbFull: RadioButton
     private lateinit var seekDelay: SeekBar
@@ -1085,11 +1311,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etName: EditText
     private lateinit var etKey: EditText
     private lateinit var spKey: Spinner
-    private lateinit var savedBox: LinearLayout
 
     // --- Tarama durumu ---
     private var specs: List<CodeSpec> = emptyList()
-    private var scanDelay = 150
+    private var scanDelay = 600
     @Volatile private var running = false
     @Volatile private var lastSent = -1
     private var verifyIdx = 0
@@ -1107,7 +1332,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    //  ARAYÜZ
+    //  GENEL ARAYÜZ (iki sayfa + alt sekme çubuğu)
     // =====================================================================
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -1121,19 +1346,74 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildUi() {
+        val outer = LinearLayout(this)
+        outer.orientation = LinearLayout.VERTICAL
+
+        val frame = FrameLayout(this)
+        scanPage = buildScanPage()
+        savedPage = buildSavedPage()
+        frame.addView(
+            scanPage,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        frame.addView(
+            savedPage,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        outer.addView(frame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.setBackgroundColor(Color.parseColor("#1F1F23"))
+        tabScan = tabView("🔍  Kumanda Ara") { selectTab(0) }
+        tabSaved = tabView("🎛  Kumandalarım") { selectTab(1) }
+        bar.addView(tabScan, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(tabSaved, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        outer.addView(
+            bar,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+
+        setContentView(outer)
+        selectTab(0)
+    }
+
+    private fun tabView(text: String, onClick: () -> Unit): TextView {
+        val tv = TextView(this)
+        tv.text = text
+        tv.textSize = 15f
+        tv.setTypeface(tv.typeface, Typeface.BOLD)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(dp(8), dp(16), dp(8), dp(16))
+        tv.isClickable = true
+        tv.setOnClickListener { onClick() }
+        return tv
+    }
+
+    private fun selectTab(i: Int) {
+        scanPage.visibility = if (i == 0) View.VISIBLE else View.GONE
+        savedPage.visibility = if (i == 1) View.VISIBLE else View.GONE
+        val on = Color.parseColor("#FFB300")
+        val off = Color.parseColor("#9E9E9E")
+        tabScan.setTextColor(if (i == 0) on else off)
+        tabSaved.setTextColor(if (i == 1) on else off)
+        if (i == 1) refreshSaved()
+    }
+
+    // =====================================================================
+    //  SAYFA 1: KUMANDA ARA
+    // =====================================================================
+    private fun buildScanPage(): ScrollView {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(dp(16), dp(16), dp(16), dp(32))
-        val scroll = ScrollView(this)
-        scroll.addView(root)
-        setContentView(scroll)
 
-        root.addView(label("IR Lamba Bulucu", 22f, true))
+        root.addView(label("Kumanda Ara", 22f, true))
         root.addView(
             label(
                 "Telefonun üst kenarındaki IR ledini lambaya doğrultun (1-2 m). " +
                     "Taramayı başlatın; lamba tepki verdiği anda \"LAMBA YANDI\" düğmesine basın. " +
-                    "Bulunan adres kaydedilince kumandanın tüm tuşlarını öğretebilirsiniz.",
+                    "Kaydedince kumanda “Kumandalarım” sayfasına eklenir.",
                 14f
             )
         )
@@ -1176,21 +1456,28 @@ class MainActivity : AppCompatActivity() {
         rg.addView(rbFull)
         root.addView(rg)
 
-        // Hız
-        tvDelay = label("Kodlar arası bekleme: 150 ms", 14f)
+        // Hız (saniye)
+        tvDelay = label(delayText(600), 14f)
         root.addView(tvDelay)
         seekDelay = SeekBar(this)
-        seekDelay.max = 450
-        seekDelay.progress = 100
+        seekDelay.max = 28 // 0,2 sn ... 3,0 sn
+        seekDelay.progress = 4 // varsayılan 0,6 sn
         seekDelay.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                tvDelay.text = "Kodlar arası bekleme: ${p + 50} ms"
+                tvDelay.text = delayText(200 + p * 100)
             }
 
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) {}
         })
         root.addView(seekDelay)
+        root.addView(
+            label(
+                "Yavaş tarama, lambanın tepkisini yakalamayı kolaylaştırır. " +
+                    "YANDI'ya basınca uygulama birkaç kod geri gider.",
+                12f
+            )
+        )
 
         // Başlat / Yandı
         btnScan = Button(this)
@@ -1241,9 +1528,9 @@ class MainActivity : AppCompatActivity() {
         spKey.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            IrGen.DEFAULT_KEYS
+            IrGen.DEFAULT_KEYS.map { IrGen.keyPickerLabel(it) }
         )
-        spKey.setSelection(maxOf(0, IrGen.DEFAULT_KEYS.indexOf("POWER ON")))
+        spKey.setSelection(0)
         verifyBox.addView(spKey)
 
         etKey = EditText(this)
@@ -1254,12 +1541,13 @@ class MainActivity : AppCompatActivity() {
         verifyBox.addView(navBtn("✅ Bu doğru — kaydet ve kumandayı aç") { saveCurrent() })
         root.addView(verifyBox)
 
-        // Kayıtlı kumandalar
-        root.addView(label("Kayıtlı kumandalar", 18f, true))
-        savedBox = LinearLayout(this)
-        savedBox.orientation = LinearLayout.VERTICAL
-        root.addView(savedBox)
+        val sv = ScrollView(this)
+        sv.addView(root)
+        return sv
     }
+
+    private fun delayText(ms: Int): String =
+        "Kodlar arası bekleme: " + "%.1f".format(ms / 1000.0) + " sn"
 
     private fun navBtn(t: String, action: () -> Unit): Button {
         val b = Button(this)
@@ -1272,6 +1560,101 @@ class MainActivity : AppCompatActivity() {
         LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
 
     // =====================================================================
+    //  SAYFA 2: KUMANDALARIM
+    // =====================================================================
+    private fun buildSavedPage(): ScrollView {
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setPadding(dp(16), dp(16), dp(16), dp(32))
+        root.addView(label("Kumandalarım", 22f, true))
+        root.addView(
+            label(
+                "Kumandaya dokun: açma-kapama, ışık ve diğer tuşlar. " +
+                    "Basılı tut veya ⋮: ad değiştir, bilgi, sil.",
+                13f
+            )
+        )
+        savedBox = LinearLayout(this)
+        savedBox.orientation = LinearLayout.VERTICAL
+        root.addView(savedBox)
+
+        val sv = ScrollView(this)
+        sv.addView(root)
+        return sv
+    }
+
+    private fun refreshSaved() {
+        savedBox.removeAllViews()
+        val list = store.load()
+        if (list.isEmpty()) {
+            savedBox.addView(
+                label("Henüz kayıtlı kumanda yok. “Kumanda Ara” sayfasından lambanı bul ve kaydet.", 14f)
+            )
+            return
+        }
+        for (r in list) {
+            val learned = r.keys.count { it.cmd >= 0 }
+            val card = RemoteCardView(this)
+            card.setInfo(
+                r.name,
+                r.proto.name + " • adres 0x" + "%02X".format(r.addr) + " • " + learned + " tuş"
+            )
+            card.setOnClickListener { openPanel(r) }
+            card.setOnLongClickListener {
+                remoteMenu(r)
+                true
+            }
+
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.addView(card, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(
+                uiPill(this, "⋮", 22f) { remoteMenu(r) },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            lp.setMargins(0, dp(6), 0, dp(6))
+            savedBox.addView(row, lp)
+        }
+    }
+
+    private fun openPanel(r: Remote) {
+        RemotePanel(this, store, r, { freq, pattern -> transmit(freq, pattern) }) {
+            refreshSaved()
+        }.show()
+    }
+
+    private fun remoteMenu(r: Remote) {
+        val items = arrayOf("Aç (kumanda paneli)", "Yeniden adlandır", "Bilgi / kodlar", "Sil")
+        AlertDialog.Builder(this)
+            .setTitle(r.name)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> openPanel(r)
+                    1 -> uiAsk(this, "Kumanda adı", r.name) { n ->
+                        r.name = n
+                        store.upsert(r)
+                        refreshSaved()
+                    }
+                    2 -> uiMessage(this, r.name, remoteInfoText(r))
+                    3 -> uiConfirm(this, "“" + r.name + "” kumandası silinsin mi?") {
+                        store.delete(r.id)
+                        refreshSaved()
+                    }
+                    else -> {}
+                }
+            }
+            .show()
+    }
+
+    // =====================================================================
     //  TARAMA
     // =====================================================================
     private fun startScan() {
@@ -1281,7 +1664,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         specs = IrGen.generate(protos, rbFull.isChecked)
-        scanDelay = seekDelay.progress + 50
+        scanDelay = 200 + seekDelay.progress * 100
         lastSent = -1
         running = true
         verifyBox.visibility = View.GONE
@@ -1351,7 +1734,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         stopScan()
-        val back = 1500 / (scanDelay + 70) + 2 // ~1,5 sn tepki süresi
+        val back = 1600 / (scanDelay + 70) + 2 // ~1,6 sn tepki süresi
         verifyIdx = maxOf(0, lastSent - back)
         verifyBox.visibility = View.VISIBLE
         showVerify()
@@ -1385,7 +1768,11 @@ class MainActivity : AppCompatActivity() {
         val typedName = etName.text.toString().trim()
         val name = if (typedName.isEmpty()) "Lamba" else typedName
         val typedKey = etKey.text.toString().trim()
-        val keyName = if (typedKey.isNotEmpty()) typedKey else (spKey.selectedItem as? String ?: "POWER ON")
+        val keyName = if (typedKey.isNotEmpty()) {
+            typedKey
+        } else {
+            IrGen.DEFAULT_KEYS[spKey.selectedItemPosition.coerceIn(0, IrGen.DEFAULT_KEYS.size - 1)]
+        }
 
         // Aynı protokol + adres zaten kayıtlıysa yeni kumanda açma, tuşu ona ekle
         val existing = store.load().firstOrNull { it.proto == s.proto && it.addr == s.addr }
@@ -1398,8 +1785,9 @@ class MainActivity : AppCompatActivity() {
             } else {
                 remote.keys.add(Key(keyName, s.cmd))
             }
+            remote.lastPos = s.cmd
             if (typedName.isNotEmpty()) remote.name = typedName
-            uiToast(this, "Mevcut kumandaya eklendi: " + keyName)
+            uiToast(this, "Mevcut kumandaya eklendi: " + IrGen.keyPickerLabel(keyName))
         } else {
             remote = Remote.create(name, s.proto, s.addr, s.cmd, keyName, System.currentTimeMillis())
             uiToast(this, "Kumanda kaydedildi: " + name)
@@ -1409,74 +1797,8 @@ class MainActivity : AppCompatActivity() {
         etName.setText("")
         etKey.setText("")
         verifyBox.visibility = View.GONE
-        refreshSaved()
+        selectTab(1)
         openPanel(remote)
-    }
-
-    // =====================================================================
-    //  KAYITLI KUMANDALAR
-    // =====================================================================
-    private fun refreshSaved() {
-        savedBox.removeAllViews()
-        val list = store.load()
-        if (list.isEmpty()) {
-            savedBox.addView(label("Henüz kayıtlı kumanda yok.", 14f))
-            return
-        }
-        for (r in list) {
-            val learned = r.keys.count { it.cmd >= 0 }
-            val row = LinearLayout(this)
-            row.orientation = LinearLayout.HORIZONTAL
-
-            val openBtn = androidx.appcompat.widget.AppCompatButton(this)
-            openBtn.text = "🎛 " + r.name + "\n" + r.proto.name + " • adres 0x" +
-                "%02X".format(r.addr) + " • " + learned + "/" + r.keys.size + " tuş"
-            openBtn.setAllCaps(false)
-            openBtn.setOnClickListener { openPanel(r) }
-
-            val more = Button(this)
-            more.text = "⋮"
-            more.setOnClickListener { remoteMenu(r) }
-
-            row.addView(openBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(
-                more,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-            savedBox.addView(row)
-        }
-    }
-
-    private fun openPanel(r: Remote) {
-        RemotePanel(this, store, r, { freq, pattern -> transmit(freq, pattern) }) {
-            refreshSaved()
-        }.show()
-    }
-
-    private fun remoteMenu(r: Remote) {
-        val items = arrayOf("Aç (kumanda paneli)", "Yeniden adlandır", "Bilgi / kodlar", "Sil")
-        AlertDialog.Builder(this)
-            .setTitle(r.name)
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> openPanel(r)
-                    1 -> uiAsk(this, "Kumanda adı", r.name) { n ->
-                        r.name = n
-                        store.upsert(r)
-                        refreshSaved()
-                    }
-                    2 -> uiMessage(this, r.name, remoteInfoText(r))
-                    3 -> uiConfirm(this, "“" + r.name + "” kumandası silinsin mi?") {
-                        store.delete(r.id)
-                        refreshSaved()
-                    }
-                    else -> {}
-                }
-            }
-            .show()
     }
 
     // =====================================================================
